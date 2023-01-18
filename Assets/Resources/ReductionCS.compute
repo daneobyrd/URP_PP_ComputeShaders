@@ -1,0 +1,59 @@
+﻿//=================================================================================================
+//
+//	Auto Exposure CS Sample
+//  by MJP
+//  http://mynameismjp.wordpress.com/
+//
+//  All code and content licensed under Microsoft Public License (Ms-PL)
+//
+//=================================================================================================
+
+#pragma kernel ReductionCS
+
+// Constants
+static const uint TGSize_ = 8u;
+static const uint TotalNumThreads = TGSize_ * TGSize_;
+
+//=================================================================================================
+// Resources
+//=================================================================================================
+Texture2D<float> InputTexture;
+
+RWTexture2D<float> OutputTexture;
+
+// Shared memory
+groupshared float4 SharedMem[TotalNumThreads];
+
+//=================================================================================================
+// Reduces by TGSize_ x TGSize_
+//=================================================================================================
+[numthreads(TGSize_, TGSize_, 1)]
+void ReductionCS(uint3 GroupID : SV_GroupID, uint3 GroupThreadID : SV_GroupThreadID)
+{
+    const uint ThreadIdx = GroupThreadID.y * TGSize_ + GroupThreadID.x;
+    
+    const uint2 SampleIdx = (GroupID.xy * TGSize_ + GroupThreadID.xy) * 2;
+    float4 sample = 0.0f;
+    sample.x = InputTexture[SampleIdx + uint2(0, 0)];
+    sample.y = InputTexture[SampleIdx + uint2(1, 0)];
+    sample.z = InputTexture[SampleIdx + uint2(0, 1)];
+    sample.w = InputTexture[SampleIdx + uint2(1, 1)];
+
+    // Store in shared memory
+    SharedMem[ThreadIdx] = sample;
+    GroupMemoryBarrierWithGroupSync();
+
+    // Parallel reduction
+    [unroll(TotalNumThreads)]
+    for(uint s = TotalNumThreads / 2; s > 0; s >>= 1)
+    {
+        if(ThreadIdx < s)
+            SharedMem[ThreadIdx] += SharedMem[ThreadIdx + s];
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Have the first thread write out to the output texture
+    if(ThreadIdx == 0)
+        OutputTexture[GroupID.xy] =  dot(SharedMem[0], 0.25f) / TotalNumThreads;
+}

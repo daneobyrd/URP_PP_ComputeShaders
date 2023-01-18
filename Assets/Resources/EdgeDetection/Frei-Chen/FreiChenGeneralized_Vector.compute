@@ -1,0 +1,489 @@
+﻿#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+#pragma kernel KStdDevVector                KERNEL_SIZE=8  STD_DEV_VECTOR=KStdDevVector
+#pragma kernel KFreiChenGeneralizedVector         KERNEL_SIZE=8  FREI_CHEN_GENERALIZED_VECTOR=KFreiChenGeneralizedVector
+
+// #include "Packages/com.unity.render-pipelines.universal/Shaders/PostProcessing/Common.hlsl"
+// #include "FC_Filters.hlsl"
+#include "Assets/Resources/Utilities/MathUtils/std_deviation.hlsl"
+#include "Helpers/FreiChen_Common.hlsl"
+#include "Helpers/FreiChen_General.hlsl"
+
+TEXTURE2D(Source);
+TEXTURE2D(stdDevTexCS);
+RW_TEXTURE2D(float4, Result);
+
+CBUFFER_START(cbuff)
+float4 _Size; // x: src width, y: src height, z: 1/width, w: 1/height
+float4 MeanStd;
+CBUFFER_END
+
+// Constants
+static const float TotalNumThreads = 64; // numthreads.x * numthreads.y
+static const float TotalNumGroups = floor(_Size.xy * rcp(8)).x * floor(_Size.xy * rcp(8)).y;
+
+// 16x16 pixel grid will be read by an 8x8 center.
+// 8x8 center with four pixel padding on each side.
+
+// Each uint is two color channels packed together.
+// The reason for separating channels is to reduce bank conflicts in the local data memory
+// controller. A large stride will cause more threads to collide on the same memory bank.
+groupshared uint gs_cacheR[128];
+groupshared uint gs_cacheG[128];
+groupshared uint gs_cacheB[128];
+groupshared uint gs_cacheA[128];
+
+// Pack two 32bit float4 in an uint and store in gs_cache.
+void Store2Pixels(uint index, float4 pixel1, float4 pixel2)
+{
+    gs_cacheR[index] = f32tof16(pixel1.r) | f32tof16(pixel2.r) << 16;
+    gs_cacheG[index] = f32tof16(pixel1.g) | f32tof16(pixel2.g) << 16;
+    gs_cacheB[index] = f32tof16(pixel1.b) | f32tof16(pixel2.b) << 16;
+    gs_cacheA[index] = f32tof16(pixel1.a) | f32tof16(pixel2.a) << 16;
+}
+// Load two 32bit float4 from gs_cache.
+void Load2Pixels(uint index, out float4 pixel1, out float4 pixel2)
+{
+    uint rr = gs_cacheR[index];
+    uint gg = gs_cacheG[index];
+    uint bb = gs_cacheB[index];
+    uint aa = gs_cacheA[index];
+    pixel1 = float4(f16tof32(rr), f16tof32(gg), f16tof32(bb), f16tof32(aa));
+    pixel2 = float4(f16tof32(rr >> 16), f16tof32(gg >> 16), f16tof32(bb >> 16), f16tof32(aa >> 16));
+}
+
+void Store1Pixel(uint index, float4 pixel)
+{
+    gs_cacheR[index] = asuint(pixel.r);
+    gs_cacheG[index] = asuint(pixel.g);
+    gs_cacheB[index] = asuint(pixel.b);
+    gs_cacheA[index] = asuint(pixel.a);
+}
+void Load1Pixel(uint index, out float4 pixel)
+{
+    pixel = asfloat(uint4(gs_cacheR[index], gs_cacheG[index], gs_cacheB[index], gs_cacheA[index]));
+}
+void Load1Uint(uint index, out uint4 pixel)
+{
+    pixel = uint4(gs_cacheR[index], gs_cacheG[index], gs_cacheB[index], gs_cacheA[index]);
+}
+uint4 Fetch1Uint(uint index)
+{
+    return uint4(gs_cacheR[index], gs_cacheG[index], gs_cacheB[index], gs_cacheA[index]);
+}
+
+void Load1Half(uint index, out float4 pixel)
+{
+    pixel = f16tof32((uint4(gs_cacheR[index], gs_cacheG[index], gs_cacheB[index], gs_cacheA[index])));
+}
+
+void Addto1StoredPixel(uint index, float4 pixel)
+{
+    gs_cacheR[index] += asuint(pixel.r);
+    gs_cacheG[index] += asuint(pixel.g);
+    gs_cacheB[index] += asuint(pixel.b);
+    gs_cacheA[index] += asuint(pixel.a);
+}
+void AddToOffsetStoredPixel(uint index, const uint offset)
+{
+    gs_cacheR[index] += gs_cacheR[index + offset];
+    gs_cacheG[index] += gs_cacheG[index + offset];
+    gs_cacheB[index] += gs_cacheB[index + offset];
+    gs_cacheA[index] += gs_cacheA[index + offset];
+}
+
+static uint packed_offset[25] =
+{
+    0,  1,   2,   3,  4,
+    8,  9,  10,  11, 12,
+    16, 17, 18,  19, 20,
+    24, 25, 26,  27, 28,
+    32, 33, 34,  35, 36
+};
+
+/*
+Top-left to bottom-right
+┌─────┬─────┐------------------------------------------
+│ s00 │ s10 │     -     -     -     -     -     -  x  -
+├─────┼─────┼------------------------------------------ 
+│ s01 │ s11 │     -     -     -     -     -  x  -     - 
+└─────┴─────┼─────┬─────┐------------------------------ 
+-     -     │ s22 │ s32 │     -     -  x  -     -     - 
+------------├─────┼─────┼------------------------------ 
+-     -     │ s22 │ s33 │     -  x  -     -     -     - 
+------------└─────┴─────┘------------------------------ 
+-     -     -     -     -     -     -     -     -     - 
+------------------------┌─────┬─────┐------------------ 
+-     -     -     -  x  │ s45 │ s55 │     -     -     - 
+------------------------└─────┴─────┼─────┬─────┐------ 
+-     -     -  x  -     -     -     │ s66 │ s76 │     - 
+------------------------------------├─────┼─────┼------
+-     -  x  -     -     -     -     │ s77 │ s77 │     -
+------------------------------------└─────┴─────┼─────┐
+-  x  -     -     -     -     -     -     -     │ s88 │
+------------------------------------------------└─────┘
+*/
+void fetch_diagonal(uint leftMostIndex, out float4 diag1, out float4 d_extra1)
+{
+    float4
+    s00, s10,           
+    s01, s11,
+              s22, s32, 
+              s23, s33, 
+
+                        s45, s55,
+                                  s66, s76,
+                                  s67, s77,          
+                                            s88;
+
+    Load2Pixels(leftMostIndex,       s00, s10);      
+    Load2Pixels(leftMostIndex +  8u, s01, s11); 
+    Load2Pixels(leftMostIndex + 17u, s22, s32);
+    Load2Pixels(leftMostIndex + 25u, s23, s33);
+    
+    Load2Pixels(leftMostIndex + 42u, s45, s55);
+    Load2Pixels(leftMostIndex + 51u, s66, s76);
+    Load2Pixels(leftMostIndex + 59u, s67, s77);
+    Load1Half(leftMostIndex + 68u, s88);
+
+    diag1 = s00 + s11 + s22 + s33 + s55 + s66 + s77 + s88;
+    d_extra1 = s10 + s01 + s32 + s23 + s45 + s76 + s67;
+}
+
+/*                                                            
+Top-right to bottom-left                                      
+┌-----------------------------------------------┌─────┐ 
+   •  -     -     -     -     -     -     -     │ s80 │ 
+├-----------------------------------┌─────┬─────┼─────┘ 
+                              -     │ s61 │ s71 │       
+├-----------------------------------├─────┼─────┼-----┤ 
+      -     -  •  -     -     -     │ s62 │ s72 │      
+├-----------------------┌─────┬─────┼─────┴─────┘-----┤ 
+                  -  •  │ s43 │ s53 │                  
+├-----------------------└─────┴─────┘-----------------┤ 
+      -     -     -     -     -     -                  
+├-----------┌─────┬─────┐-----------------------------┤ 
+      -     │ s25 │ s35 │                 -     -      
+├-----------├─────┼─────┤-----------------------------┤ 
+      -     │ s26 │ s36 │     -     -  •               
+┌─────┬─────┼─────┴─────┘-----------------------------┤ 
+│ s07 │ s17 │     -     -                 -  •  -      
+├─────┼─────┤-----------------------------------------┤ 
+│ s08 │ s18 │     -     -     -     -     -     -  •   
+└─────└─────┘-----------------------------------------┘ 
+*/                                                            
+void fetch_anti_diagonal(uint leftMostIndex, out float4 anti_diag1, out float4 a_extra1)
+{
+    float4
+                                           s80,
+                                 s61, s71,
+                                 s62, s72,
+                       s43, s53, 
+         
+              s25, s35,
+              s26, s36,
+    s07, s17,
+    s08, s18;
+    
+    Load1Half(leftMostIndex + 4u, s80);
+    Load2Pixels(leftMostIndex + 11u, s61, s71);
+    Load2Pixels(leftMostIndex + 19u, s62, s72);
+    Load2Pixels(leftMostIndex + 26u, s43, s53);
+
+    Load2Pixels(leftMostIndex + 41u, s25, s35);
+    Load2Pixels(leftMostIndex + 49u, s26, s36);
+    Load2Pixels(leftMostIndex + 56u, s07, s17);
+    Load2Pixels(leftMostIndex + 64u, s08, s18);
+    
+    anti_diag1 = s80 + s71 + s62 + s53 + s35 + s26 + s17 + s08;
+    a_extra1 = s61 + s72 + s43 + s25 + s36 + s07 + s18;
+}
+
+// Load six gs_cache entries (12 pixels).
+// Calculate standard deviation from 3x3 neighborhood centered around leftMostIndex and leftMostIndex + 1.
+void StdDev2Pixels(uint outIndex, uint leftMostIndex, out float4 std1, out float4 std2)
+{
+    /*
+    ┌──────•──────┬───────•──────┐
+    │ a[0] │ a[1] │  a[2] │      │
+    │      │ b[0] │  b[1] │ b[2] │
+    ├──────•──────┼───────•──────┤
+    │ a[3] │ a[4] │  a[5] │      │
+    │      │ b[3] │  b[4] │ b[5] │
+    ├──────•──────┼───────•──────┤
+    │ a[6] │ a[7] │  a[8] │      │
+    │      │ b[6] │  b[7] │ b[8] │
+    └──────•──────┴───────•──────┘
+    */
+    float4 a[9], b[9];
+    Load2Pixels(leftMostIndex - 8u, a[0], a[1]);
+    Load2Pixels(leftMostIndex - 7u, a[2], b[2]);
+    
+    Load2Pixels(leftMostIndex, a[3], a[4]);
+    Load2Pixels(leftMostIndex + 1u, a[5], b[5]);
+    
+    Load2Pixels(leftMostIndex + 8u,a[6], a[7]);
+    Load2Pixels(leftMostIndex + 9u,a[8], b[8]);
+
+    b[0] = a[1];
+    b[1] = a[2];
+    b[3] = a[4];
+    b[4] = a[5];
+    b[6] = a[7];
+    b[7] = a[8];
+
+    float3x3 mat1[4];
+    float3x3 mat2[4];
+    asfloat3x3_array(a, mat1);
+    asfloat3x3_array(b, mat2);
+    std1 = std_dev_3x3_f4(mat1);
+    std2 = std_dev_3x3_f4(mat2);
+    
+    Store2Pixels(outIndex, std1, std2);
+}
+
+// Load eight gs_cache entries (16 pixels).
+// Calculate standard deviation from 3x3 neighborhoods centered around the quad this thread reads.
+void StdDevQuad(uint outIndex, uint leftMostIndex,
+                   out float4 std1,
+                   out float4 std2,
+                   out float4 std3,
+                   out float4 std4)
+{
+    /*
+    a___ ab__ ab__ _b__
+    a_c_ abcd abcd _b_d
+    a_c_ abcd abcd _b_d
+    __c_ __cd __cd ___d
+    */
+
+    float4 a[9], b[9], c[9], d[9];
+    ZERO_INITIALIZE_ARRAY(float4, a, 9);
+    ZERO_INITIALIZE_ARRAY(float4, b, 9);
+    ZERO_INITIALIZE_ARRAY(float4, c, 9);
+    ZERO_INITIALIZE_ARRAY(float4, d, 9);
+
+    Load2Pixels(leftMostIndex - 8u, a[0], a[1]);
+    Load2Pixels(leftMostIndex - 7u, a[2], b[2]);
+    Load2Pixels(leftMostIndex,      a[3], a[4]);
+    Load2Pixels(leftMostIndex + 1u, a[5], b[5]);
+    Load2Pixels(leftMostIndex + 8u, a[6], a[7]);
+
+    b[0] = a[1];
+    b[1] = a[2];
+    b[3] = a[4];
+    b[4] = a[5];
+    b[6] = a[7];
+    b[7] = a[8];
+    Load2Pixels(leftMostIndex + 9u,a[8], b[8]);
+
+    c[0] = a[3];
+    c[1] = a[4];
+    c[2] = a[5];
+    c[3] = a[6];
+    c[4] = a[7];
+    c[5] = a[8];
+    Load2Pixels(leftMostIndex + 16u,c[6], c[7]);
+    Load2Pixels(leftMostIndex + 17u,c[8], d[8]);
+
+    d[0] = b[3];
+    d[1] = b[4];
+    d[2] = b[5];
+    d[3] = b[6];
+    d[4] = b[7];
+    d[5] = b[8];
+    d[6] = c[7];
+    d[7] = c[8];
+
+    float3x3 mat1[4]; asfloat3x3_array(a, mat1);
+    float3x3 mat2[4]; asfloat3x3_array(b, mat2);
+    float3x3 mat3[4]; asfloat3x3_array(c, mat3);
+    float3x3 mat4[4]; asfloat3x3_array(d, mat4);
+    
+    std1 = std_dev_3x3_f4(mat1);
+    std2 = std_dev_3x3_f4(mat2);
+    std3 = std_dev_3x3_f4(mat3);
+    std4 = std_dev_3x3_f4(mat4);
+
+    Store2Pixels(outIndex, std1, std2);
+    Store2Pixels(outIndex + 8u, std3, std4);
+}
+
+/*
+SV_GroupID = ID of thread group; range depends on Dispatch call.         
+SV_GroupThreadID = ID of thread in a thread group; range depends on numthreads.
+SV_DispatchThreadID = SV_GroupID * numthreads + SV_GroupThreadID.              
+*/
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void STD_DEV_VECTOR(uint2 groupId : SV_GroupID,
+                    uint2 groupThreadId : SV_GroupThreadID,
+                    uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint2 id = dispatchThreadId.xy;
+    const uint2 size = uint2(_Size.xy) - 1u;
+    
+    // Upper-left pixel coordinate of quad that this thread will read
+    const int2 threadUL = (groupThreadId << 1) + (groupId << 3) - 4;
+    const uint2 uthreadUL = uint2(max(0, threadUL));
+    
+    // const int2 threadUL = (groupThreadId * 2) + (groupId * 8) - 4;
+    // uint2 SampleIdx = (groupThreadId + groupId * 8) * 2    
+    
+    const uint2 c00 = min(uthreadUL + uint2(0u, 0u), size);
+    const uint2 c10 = min(uthreadUL + uint2(1u, 0u), size);
+    const uint2 c01 = min(uthreadUL + uint2(0u, 1u), size);
+    const uint2 c11 = min(uthreadUL + uint2(1u, 1u), size);
+    
+    const float4 p00 = Source[c00];
+    const float4 p10 = Source[c10];
+    const float4 p01 = Source[c01];
+    const float4 p11 = Source[c11];
+    
+    // Store the 4 downsampled pixels in LDS
+    const uint row = groupThreadId.y << 4u; // Left shift 4 to get the fullscreen coord
+    const uint destIdx = row + groupThreadId.x;
+    // uint ThreadIdx = groupThreadId.y * 8 + groupThreadId.x;
+
+    // uint row = groupThreadId.y * 16; // * 8 * 2 
+    
+    Store2Pixels(destIdx, p00, p10);
+    Store2Pixels(destIdx + 8u, p01, p11);
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    const uint outIndex = row + (groupThreadId.x << 1u);
+    const uint leftMostIndex = destIdx + (groupThreadId.x & 4u);
+    
+    // Store standard deviation for the 4 pixels.
+    float4 std00, std10, std01, std11;
+    StdDevQuad(outIndex, leftMostIndex, std00, std10, std01, std11);
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Parallel reduction
+    UNITY_UNROLLX(128);
+    for(uint s = 128 / 2; s > 0; s >>= 1)
+    {
+        if(outIndex < s)
+            AddToOffsetStoredPixel(outIndex, s);
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+    // Add all stored values.
+    
+    // The first thread in each threadGroup calculates the group's mean value.
+    if(destIdx == 0)
+    {
+        uint4 gs_cache0;
+        Load1Uint(0, gs_cache0); // Uint sum of 128 gs entries.
+        // const float4 gs_cache_sum = AddFirst16AndLast16Bits_uint(gs_cache0); // Float sum of 256 pixels.
+
+        // MeanStd += gs_cache_sum * rcp(4 * 64);
+        // Sum of 256 pixels / 256 // = 4 * 64
+        // Add group's mean to _MeanStd
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Have one thread get the mean of the sum of groups' mean deviation.
+    if (!all(id)) // if dispatchThreadId 0
+    {
+        // Sum of groups' means / total number of groups
+        MeanStd *= rcp(TotalNumGroups);
+    }
+    
+    GroupMemoryBarrierWithGroupSync();
+
+    // Maybe only every other thread needs to write data to the texture? Each thread writing two pixels?
+    // Is it less performant to only have half the threads write even if there would be overlap otherwise?
+    // Is there another task I can have those threads perform?
+    
+    // Update Subspace with whether current pixel's std-dev is less than mean std-dev.
+    // If pixel mean std-dev > texture mean std-dev, pixel should be projected to edge or line subspace.
+    // If pixel mean std-dev !> texture mean std-dev, pixel is part of a uniform-luminance region.
+    
+    // Each thread compares quad pixels' std_dev with the texture's mean std_dev
+    // 
+    Result[c00] = bool4(std00 > MeanStd);
+    Result[c10] = bool4(std10 > MeanStd);
+    Result[c01] = bool4(std01 > MeanStd);
+    Result[c11] = bool4(std11 > MeanStd);
+    
+    GroupMemoryBarrierWithGroupSync();
+    // Not needed as there aren't any operations after this..?
+}
+
+/*
+SV_GroupID = ID of thread group; range depends on Dispatch call.         
+SV_GroupThreadID = ID of thread in a thread group; range depends on numthreads.
+SV_DispatchThreadID = SV_GroupID * numthreads + SV_GroupThreadID.              
+*/
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void FREI_CHEN_GENERALIZED_VECTOR(uint2 groupId : SV_GroupID,
+                           uint2 groupThreadId : SV_GroupThreadID,
+                           uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    // Every pixel component in RWTexture2D(Subspace) is either
+    // 0: Measurement subspace (uniform luminance)
+    // 1: Edge or Line subspace
+    
+    const uint2 id = dispatchThreadId.xy;
+    const uint2 size = uint2(_Size.xy) - 1u;
+    
+    // Upper-left pixel coordinate of quad that this thread will read
+    const int2 threadUL = (groupThreadId << 1) + (groupId << 3) - 4;
+    const uint2 uthreadUL = uint2(max(0, threadUL));
+    
+    const uint2 c00 = min(uthreadUL + uint2(0u, 0u), size);
+    const uint2 c10 = min(uthreadUL + uint2(1u, 0u), size);
+    const uint2 c01 = min(uthreadUL + uint2(0u, 1u), size);
+    const uint2 c11 = min(uthreadUL + uint2(1u, 1u), size);
+    
+    const float4 p00 = Source[c00];
+    const float4 p01 = Source[c01];
+    const float4 p10 = Source[c10];
+    const float4 p11 = Source[c11];
+    
+    // Store the 4 downsampled pixels in LDS
+    const uint row = groupThreadId.y << 4u;
+    const uint destIdx = row + groupThreadId.x;
+    
+    Store2Pixels(destIdx, p00, p10);
+    Store2Pixels(destIdx + 8u, p01, p11);    
+    GroupMemoryBarrierWithGroupSync();
+    
+    const uint outIndex = row + (groupThreadId.x << 1u);
+    const uint leftMostIndex = destIdx + (groupThreadId.x & 4u);
+    
+    // * * * * * * * * * * * * * * * * * * * * * * * * * //
+    //   Fetch sum of texels' per thread from gs_cache   //
+    // * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+    // float4 diag1, anti_diag1;
+    // float4 d_extra1, a_extra1, remaining1;
+
+    // fetch_diagonal(leftMostIndex, diag1, d_extra1);
+    // fetch_anti_diagonal(leftMostIndex, anti_diag1, a_extra1);
+    // fetch_remaining(leftMostIndex, remaining1);
+    // remaining1 += (d_extra1 + a_extra1);
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Measurement subspace
+    // const float4 pixel_uniform = (diag1 + anti_diag1 + remaining1) * measurement_coeff;
+    // Edge subspace
+    // const float4 pixel_edge = edge_diag_coeff * (diag1 - anti_diag1); // * edge_anti_diag_coeff);
+    // Line subspace
+    // const float4 pixel_line = (diag1 + anti_diag1) * line_x_coeff + (remaining1 * line_inv_coeff);
+
+    // const float4 edge_sq_norm = (pixel_edge, 4);
+    // const float4 line_sq_norm = pow(pixel_line, 4);
+    // const float4 pixel_EL = max(pixel_edge, pixel_line); //, float4(edge_sq_norm > line_sq_norm));
+
+    // Whether pixel belongs to uniform-luminance region or is an edge/line.
+    const float4 projection = stdDevTexCS[id];
+    
+    Result[id] = projection;
+}

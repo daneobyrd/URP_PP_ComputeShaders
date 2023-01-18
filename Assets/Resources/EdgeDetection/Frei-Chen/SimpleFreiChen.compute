@@ -1,0 +1,107 @@
+﻿#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+#pragma kernel KFreiChen                           KERNEL_SIZE=8   SIMPLE_FREICHEN_SCALAR=KFreiChen
+
+// #include "Packages/com.unity.render-pipelines.universal/Shaders/PostProcessing/Common.hlsl"
+#include "Helpers/FreiChen_Common.hlsl"
+#include "Helpers/FreiChen_Filters.hlsl"
+
+TEXTURE2D(Source);
+RW_TEXTURE2D(float4, Result);
+
+CBUFFER_START(cbuff)
+float4 _Size; // x: src width, y: src height, z: 1/width, w: 1/height
+CBUFFER_END
+
+// ID of thread group; range depends on Dispatch call.
+// ID of thread in a thread group; range depends on numthreads.
+// = SV_GroupID * numthreads + SV_GroupThreadID.
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void SIMPLE_FREICHEN_SCALAR(// uint2 groupId : SV_GroupID,
+                            // uint2 groupThreadId : SV_GroupThreadID,
+                            uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint2 id = dispatchThreadId.xy;
+    static float3x3 G[9] =
+    {
+        G0, G1, G2,
+        G3, G4, G5,
+        G6, G7, G8
+    };
+
+    static float3x3 I;
+    static float cnv[9];
+
+    /* fetch the 3x3 neighbourhood and use the RGB vector's length as intensity value */
+    I = load_color_intensity3x3(Source, id, _Size);
+
+    /* Calculate the convolution values for all the masks. */
+    UNITY_UNROLLX(3)
+    for (int n = 0; n < 9; n++)
+    {
+        int i = 9 % 3;
+        int j = 9 & 3;
+        ApplyFreiChenScalar(I[i][j], G[n], cnv[n]);
+
+    }
+
+    const float Edges = (cnv[0] + cnv[1]) + (cnv[2] + cnv[3]);
+    const float Lines = (cnv[4] + cnv[5]) + (cnv[6] + cnv[7]) + (cnv[8] + Edges);
+    const float4 sqrt_EL = sqrt(Edges/Lines); // sqrt(E/L);
+    float4 frei_chen = float4(acos(sqrt_EL));
+    
+    frei_chen = RangeRemap(0, 1, frei_chen);
+
+    Result[id] = frei_chen;
+}
+
+/*
+    use the RGB vector's length as intensity value
+    I[0] = length(pixel); = √(pixel.r*pixel.r + pixel.g*pixel.g + pixel.b*pixel.b)
+    cnv[0] = dot3(I[0], G[0]); // = (dot(I[0][0], G[0][0]) + dot(I[0][1] + G[0][1]) + dot(I[0][2], G[0][2])
+    cnv[0] *= cnv[0];
+    // ...
+    float E = (cnv[0] + cnv[1]) + (cnv[2] + cnv[3]);
+    float L = (cnv[4] + cnv[5]) + (cnv[6] + cnv[7]) + (cnv[8] + E);
+    return acos(sqrt(E/L));
+    // acos(pow((E*rcp(L)), 0.5)
+ */
+
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void SIMPLE_FREICHEN_VECTOR(uint2 groupId : SV_GroupID,
+                            uint2 groupThreadId : SV_GroupThreadID,
+                            uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint2 id = dispatchThreadId.xy;
+    static float3x3 G[9] =
+    {
+        G0, G1, G2,
+        G3, G4, G5,
+        G6, G7, G8
+    };
+
+    static float4 px[9];
+    static float4 cnv[9];
+
+    for (uint i = 0; i < 9; ++i)
+    {
+        px[i] = std_dev_load(Source, id, offset_3x3[i], _Size);
+    }
+
+
+    /* calculate the convolution values for all the masks */
+    UNITY_UNROLLX(9)
+    for (uint j = 0; j < 9; j++)
+    {
+        ApplyFreiChenVector_array(px, G[j], cnv[j]);
+    }
+
+    const float4 Edges = (cnv[0] + cnv[1]) + (cnv[2] + cnv[3]);
+    const float4 Lines = (cnv[4] + cnv[5]) + (cnv[6] + cnv[7]) + (cnv[8] + Edges);
+    const float4 sqrt_EL = sqrt(Edges/Lines); // sqrt(E/L);
+    const float4 frei_chen = float4(acos(sqrt_EL));
+
+    Result[id] = frei_chen;
+}

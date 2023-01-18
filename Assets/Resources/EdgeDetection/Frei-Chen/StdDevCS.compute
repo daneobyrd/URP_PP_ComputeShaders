@@ -1,0 +1,913 @@
+﻿#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+#pragma kernel KStdDev                      KERNEL_SIZE=8  STD_DEV=KStdDev
+
+// #include "Packages/com.unity.render-pipelines.universal/Shaders/PostProcessing/Common.hlsl"
+// #include "Assets/Resources/Utilities/Compute/ThreadGroupTiling.hlsl"
+#include "Assets/Resources/Utilities/MathUtils/std_deviation.hlsl"
+#include "Helpers/FreiChen_Common.hlsl"
+
+TEXTURE2D(Source);
+// Texture2D<float> Subspace;
+RW_TEXTURE2D(float4, Result);
+
+CBUFFER_START(cbuff)
+float4 _Size; // x: src width, y: src height, z: 1/width, w: 1/height
+// float MeanStd;
+CBUFFER_END
+
+// Constants
+static const float TotalNumThreads = 64; // numthreads.x * numthreads.y
+static const float TotalNumGroups = ceil(_Size.x /16) * ceil(_Size.y /16);
+
+// 16x16 pixel grid will be read by an 8x8 thread group.
+// 8x8 center with four pixel padding on each side.
+
+groupshared uint gs_cacheR[128];
+
+// Pack two 32bit float in an uint and store in gs_cache.
+void Store2Pixels(uint index, float pixel1, float pixel2)
+{
+    gs_cacheR[index] = f32tof16(pixel1.r) | f32tof16(pixel2.r) << 16;
+}
+// Load two 32bit float from gs_cache.
+void Load2Pixels(uint index, out float pixel1, out float pixel2)
+{
+    const uint rr = gs_cacheR[index];
+    pixel1 = float(f16tof32(rr));
+    pixel2 = float(f16tof32(rr >> 16));
+}
+
+void Store1Pixel(uint index, float pixel)
+{
+    gs_cacheR[index] = asuint(pixel);
+}
+void Load1Pixel(uint index, out float pixel)
+{
+    pixel = asfloat(uint(gs_cacheR[index]));
+}
+void Load1Uint(uint index, out uint pixel)
+{
+    pixel = uint(gs_cacheR[index]);
+}
+uint Load1Uint(uint index)
+{
+    return uint(gs_cacheR[index]);
+}
+
+void StoreLowHalf(uint index, float pixel)
+{
+    gs_cacheR[index] = f32tof16(pixel);
+}
+void LoadLowHalf(uint index, out float pixel)
+{
+    pixel = f16tof32(uint(gs_cacheR[index]));
+}
+
+void StoreHighHalf(uint index, float pixel)
+{
+    gs_cacheR[index] = uint(f32tof16(pixel) << 16);
+}
+void LoadHighHalf(uint index, out float pixel)
+{
+    pixel = f16tof32(uint(gs_cacheR[index]) >> 16);
+}
+void Load_N0High_N1Low(uint index, out float output)
+{
+    // Output low half contains previous pixel high half
+    output = f16tof32(uint(gs_cacheR[index]) >> 16);
+    // Output high half contains next pixel low half
+    output += f16tof32(uint(gs_cacheR[index + 1]));
+}
+
+void AddtoPixelLowHalf(uint index, float pixel)
+{
+    gs_cacheR[index] += asuint(pixel);
+}
+void Addto1StoredPixel(uint index, uint pixel)
+{
+    gs_cacheR[index] += asuint(pixel);
+}
+void AddToOffsetStoredPixel(uint index, const uint offset)
+{
+    gs_cacheR[index] += gs_cacheR[index + offset];
+}
+
+static const uint TG_Row0 = 0x01;
+static const uint TG_Col0 = 0x02;
+static const uint TG_Col7 = 0x04;
+static const uint TG_Row7 = 0x08;   
+
+static uint TG00 = TG_Row0 | TG_Col0;
+static uint TG70 = TG_Row7 | TG_Col0;
+static uint TG07 = TG_Row0 | TG_Col7;
+static uint TG77 = TG_Row7 | TG_Col7;
+
+// Load six gs_cache entries (12 pixels).
+// Calculate standard deviation from 3x3 neighborhood centered around leftMostIndex and leftMostIndex + 1.
+void StdDev2Pixels(uint outIndex, uint upLeftIndex, out float std1, out float std2)
+{
+    /*
+    ┌──────•──────┬───────•──────┐
+    │ a[0] │ a[1] │  a[2] │      │
+    │      │ b[0] │  b[1] │ b[2] │
+    ├──────•──────┼───────•──────┤
+    │ a[3] │ a[4] │  a[5] │      │
+    │      │ b[3] │  b[4] │ b[5] │
+    ├──────•──────┼───────•──────┤
+    │ a[6] │ a[7] │  a[8] │      │
+    │      │ b[6] │  b[7] │ b[8] │
+    └──────•──────┴───────•──────┘
+    */
+    float a[9], b[9];
+
+    // Row 1
+    LoadHighHalf(upLeftIndex, a[0]);
+    Load2Pixels(upLeftIndex, a[1], a[2]);
+    LoadLowHalf(upLeftIndex, b[2]);
+    // Row 2
+    LoadHighHalf(upLeftIndex + 8u, a[3]);
+    Load2Pixels(upLeftIndex + 9u, a[4], a[5]);
+    LoadLowHalf(upLeftIndex + 10u, b[5]);
+    // Row 3
+    LoadHighHalf(upLeftIndex + 16u, a[6]);
+    Load2Pixels(upLeftIndex  + 17u,a[7], a[8]);
+    LoadLowHalf(upLeftIndex  + 18u, b[8]);
+    
+    b[0] = a[1];
+    b[1] = a[2];
+    b[3] = a[4];
+    b[4] = a[5];
+    b[6] = a[7];
+    b[7] = a[8];
+
+    const float3x3 mat1 = asfloat3x3_array9(a);
+    const float3x3 mat2 = asfloat3x3_array9(b);
+    std1 = std_dev_3x3(mat1);
+    std2 = std_dev_3x3(mat2);
+    
+    Store2Pixels(outIndex, std1, std2);
+}
+
+// destIndex must be less than 8
+void StdDevTop(uint cacheIndex, uint destIndex, out float4 std)
+{
+
+    /*
+    ──────────────
+    0,  1,  2,  3,  
+    4,  5,  6,  7,
+    8,  9, 10, 11,
+    */
+    float i[12];
+    ZERO_INITIALIZE_ARRAY(float, i, 12);
+    
+    // Row 1
+    Load2Pixels(destIndex, i[0], i[1]);
+    Load2Pixels(destIndex + 1u, i[2], i[3]);
+    // Row 2
+    Load2Pixels(destIndex + 8u, i[4], i[5]);
+    Load2Pixels(destIndex + 9u, i[6], i[7]);
+    // Row 3
+    Load2Pixels(destIndex + 16u, i[8], i[9]);
+    Load2Pixels(destIndex  + 17u,i[10], i[11]);
+
+
+    const float3x2 up00 =
+    {
+        i[0],  i[1],  i[2],
+        i[4],  i[5],  i[6]
+    };
+    const float3x2 up10 =
+    {
+        i[1], i[2], i[3],
+        i[5], i[6], i[7]
+    };
+    const float3x3 up01 =
+    {
+        i[0],  i[1],  i[2],
+        i[4],  i[5],  i[6],
+        i[8],  i[9],  i[10]
+    };
+    const float3x3 up11=
+    {
+        i[1],  i[2],  i[3], 
+        i[5],  i[6],  i[7], 
+        i[9], i[10], i[11]
+    };
+
+    float3x2 row1[2] = { up00, up10 };
+    std.xy = std_dev_3x2_f2(row1);
+    std.zw = std_dev_3x3_f2(up01, up11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+// cacheIndex must be first in row (mod8)
+void StdDevLeft(uint cacheIndex, uint destIndex, out float4 std)
+{
+
+    /*
+    0,  1,  2,  
+    3,  4,  5,
+    6,  7,  8,
+    9, 10, 11
+    */
+    float i[12];
+    ZERO_INITIALIZE_ARRAY(float, i, 12);
+    
+    // Row 1
+    Load2Pixels(destIndex, i[0], i[1]);
+    LoadLowHalf(destIndex + 1u, i[2]);
+    // Row 2
+    Load2Pixels(destIndex + 8u, i[3], i[4]);
+    LoadLowHalf(destIndex + 9u, i[5]);
+    // Row 3
+    Load2Pixels(destIndex + 16u, i[6], i[7]);
+    LoadLowHalf(destIndex  + 17u, i[8]);
+    // Row 4
+    Load2Pixels(destIndex + 24u, i[9], i[10]);
+    LoadLowHalf(destIndex + 25u, i[11]);
+    
+    const float2x3 left00 =
+    {
+        i[0],  i[1],
+        i[2],  i[3],
+        i[4],  i[5],
+    };
+    const float3x3 left10 =
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+    };
+    const float2x3 left01 =
+    {
+        i[3], i[4],
+        i[6], i[7],
+        i[9], i[10]
+    };
+    const float3x3 left11=
+    {
+        i[3], i[4], i[5],  
+        i[6], i[7], i[8],  
+        i[9], i[10], i[11] 
+    };
+
+    float2x3 col1[2] = { left00, left01 };
+    std.xy = std_dev_2x3_f2(col1);
+    std.zw = std_dev_3x3_f2(left10, left11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+// cacheIndex +1 must be first in row (mod8)
+void StdDevRight(uint cacheIndex, uint destIndex, out float4 std)
+{
+
+    /*
+    0,  1,  2,  
+    3,  4,  5,
+    6,  7,  8,
+    9, 10, 11
+    */
+    float i[12];
+    ZERO_INITIALIZE_ARRAY(float, i, 12);
+    
+    // Row 1
+    LoadHighHalf(destIndex - 9u, i[0]);
+    Load2Pixels(destIndex - 8u, i[1], i[2]);
+    // Row 2
+    LoadHighHalf(destIndex -1u, i[3]);
+    Load2Pixels(destIndex, i[4], i[5]);
+    // Row 3
+    LoadHighHalf(destIndex + 7u, i[6]);
+    Load2Pixels(destIndex + 8u, i[7], i[8]);
+    // Row 4
+    LoadHighHalf(destIndex + 15u, i[9]);
+    Load2Pixels(destIndex + 16u, i[10], i[11]);
+    
+    const float3x3 right00 = 
+    {                        
+        i[0], i[1], i[2],    
+        i[3], i[4], i[5],    
+        i[6], i[7], i[8]     
+    };
+    const float2x3 right10 =
+    {
+        i[1], i[2], 
+        i[4], i[5], 
+        i[7], i[8]
+    };
+    const float3x3 right01=
+    {
+        i[3], i[4], i[5],  
+        i[6], i[7], i[8],  
+        i[9], i[10], i[11] 
+    };
+    const float2x3 right11 =  
+    {                         
+        i[4], i[5],          
+        i[7], i[8],          
+        i[10], i[11]          
+    };
+
+    std.xy = std_dev_3x3_f2( right00, right01);
+    std.zw = std_dev_2x3_f2(right10, right11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+// cacheIndex must be greater than 
+void StdDevBottom(uint cacheIndex, uint destIndex, out float4 std)
+{
+
+    /*
+    0,  1,  2,  3,  
+    4,  5,  6,  7,
+    8,  9, 10, 11,
+    ──────────────
+    */
+    float i[12];
+    ZERO_INITIALIZE_ARRAY(float, i, 12);
+    
+    // Row 1
+    Load2Pixels(destIndex, i[0], i[1]);
+    Load2Pixels(destIndex + 1u, i[2], i[3]);
+    // Row 2
+    Load2Pixels(destIndex + 8u, i[4], i[5]);
+    Load2Pixels(destIndex + 9u, i[6], i[7]);
+    // Row 3
+    Load2Pixels(destIndex + 16u, i[8], i[9]);
+    Load2Pixels(destIndex  + 17u,i[10], i[11]);
+    
+    const float3x3 down00 =
+    {
+        i[0],  i[1],  i[2],
+        i[4],  i[5],  i[6],
+        i[8],  i[9],  i[10]
+    };
+    const float3x3 down10 =
+    {
+        i[1],  i[2],  i[3], 
+        i[5],  i[6],  i[7], 
+        i[9], i[10], i[11]
+    };
+    const float3x2 down01 =
+    {
+        i[4],  i[5],  i[6],
+        i[8],  i[9],  i[10]
+    };
+    const float3x2 down11=
+    {
+        i[5],  i[6],  i[7], 
+        i[9], i[10], i[11]
+    };
+
+    std.xy = std_dev_3x3_f2(down00, down10);
+    std.zw = std_dev_3x2_f2(down01, down11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+
+void StdDevUL(uint cacheIndex, uint destIndex, out float4 std)
+{
+
+    /*
+   ┌─────────
+   │ 0, 1, 2,  
+   │ 3, 4, 5,
+   │ 6, 7, 8,
+    */
+    float i[9];
+    ZERO_INITIALIZE_ARRAY(float, i, 9);
+    
+    // Row 1
+    Load2Pixels(destIndex, i[0], i[1]);
+    LoadLowHalf(destIndex + 1u, i[2]);
+    // Row 2
+    Load2Pixels(destIndex + 8u, i[3], i[4]);
+    LoadLowHalf(destIndex + 9u, i[5]);
+    // Row 3
+    Load2Pixels(destIndex + 16u, i[6], i[7]);
+    LoadLowHalf(destIndex  + 17u,i[8]);
+    
+    const float2x2 ul00 =
+    {
+        i[0], i[1],
+        i[3], i[4]
+    };
+    const float3x2 ul10 =
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5]
+    };
+    const float2x3 ul01 =
+    {
+        i[0], i[1],
+        i[3], i[4],
+        i[6], i[7],
+    };
+    const float3x3 ul11=
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+    };
+    
+    std.x = std_dev_2x2(ul00);
+    std.y = std_dev_3x2(ul10);
+    std.z = std_dev_2x3(ul01);
+    std.w = std_dev_3x3(ul11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+void StdDevUR(uint cacheIndex, uint destIdx, out float4 std)
+{
+    /*
+    ────────┐
+    0, 1, 2 │  
+    3, 4, 5 │
+    6, 7, 8 │
+    */
+    float i[9];
+    ZERO_INITIALIZE_ARRAY(float, i, 9);
+    
+    // Row 1
+    LoadHighHalf(destIdx - 1u, i[0]);
+    Load2Pixels(destIdx, i[1], i[2]);
+    // Row 2
+    LoadHighHalf(destIdx + 7u, i[3]);
+    Load2Pixels(destIdx + 8u, i[4], i[5]);
+    // Row 3
+    LoadHighHalf(destIdx + 15u, i[6]);
+    Load2Pixels(destIdx + 16u, i[7], i[8]);
+    
+    const float3x2 ur00 =
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5]
+    };
+    const float2x2 ur10 =
+    {
+        i[1], i[2],
+        i[4], i[5]
+    };
+    const float3x3 ur01=
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+    };
+    const float2x3 ur11 =
+    {
+        i[1], i[2],
+        i[4], i[5],
+        i[7], i[8] 
+    };
+    
+    std.x = std_dev_3x2(ur00);
+    std.y = std_dev_2x2(ur10);
+    std.z = std_dev_3x3(ur01);
+    std.w = std_dev_2x3(ur11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+void StdDevBL(uint cacheIndex, uint destIndex, out float4 std)
+{
+
+    /*
+   │ 0, 1, 2,  
+   │ 3, 4, 5,
+   │ 6, 7, 8,
+   └─────────
+    */
+    float i[9];
+    ZERO_INITIALIZE_ARRAY(float, i, 9);
+    
+    // Row 1
+    Load2Pixels(destIndex, i[0], i[1]);
+    LoadLowHalf(destIndex + 1u, i[2]);
+    // Row 2
+    Load2Pixels(destIndex + 8u, i[3], i[4]);
+    LoadLowHalf(destIndex + 9u, i[5]);
+    // Row 3
+    Load2Pixels(destIndex + 16u, i[6], i[7]);
+    LoadLowHalf(destIndex  + 17u,i[8]);
+    
+    const float2x3 bl00 =
+    {
+        i[0], i[1],
+        i[3], i[4],
+        i[6], i[7],
+    };
+    const float3x3 bl10 =
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+    };
+    const float2x2 bl01 =
+    {
+        i[3], i[4],
+        i[6], i[7]
+    };
+    const float3x2 bl11 =
+    {
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+    };
+    
+    std.x = std_dev_2x3(bl00);
+    std.y = std_dev_3x3(bl10);
+    std.z = std_dev_2x2(bl01);
+    std.w = std_dev_3x2(bl11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+void StdDevBR(uint cacheIndex, uint destIdx, out float4 std)
+{
+    /*
+    0, 1, 2 │  
+    3, 4, 5 │
+    6, 7, 8 │
+    ────────┘
+    */
+    float i[9];
+    ZERO_INITIALIZE_ARRAY(float, i, 9);
+    
+    // Row 1
+    LoadHighHalf(destIdx - 1u, i[0]);
+    Load2Pixels(destIdx, i[1], i[2]);
+    // Row 2
+    LoadHighHalf(destIdx + 7u, i[3]);
+    Load2Pixels(destIdx + 8u, i[4], i[5]);
+    // Row 3
+    LoadHighHalf(destIdx + 15u, i[6]);
+    Load2Pixels(destIdx + 16u, i[7], i[8]);
+    
+    const float3x3 br00=
+    {
+        i[0], i[1], i[2],
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+    };
+    const float2x3 br10 =
+    {
+        i[1], i[2],
+        i[4], i[5],
+        i[7], i[8] 
+    };
+    const float3x2 br01 =
+    {
+        i[3], i[4], i[5],
+        i[6], i[7], i[8]
+        
+    };
+    const float2x2 br11 =
+    {
+        i[4], i[5],
+        i[7], i[8]
+        
+    };
+    
+    std.x = std_dev_3x3(br00);
+    std.y = std_dev_2x3(br10);
+    std.z = std_dev_3x2(br01);
+    std.w = std_dev_2x2(br11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+
+// Load eight gs_cache entries (16 pixels).
+// Calculate standard deviation from 3x3 neighborhoods centered around the quad this thread reads.
+void StdDevQuad(uint cacheIndex, uint upLeftIndex, out float4 std)
+{
+     /*
+     0,  1,  2,  3,  
+     4,  5,  6,  7,
+     8,  9, 10, 11,
+    12, 13, 14, 15
+    */
+    
+    // quad read by thread is 5  6
+    //                        9 10
+    
+    /*
+    q___ qu__ qu__ _u__
+    q_a_ quad quad _u_d
+    q_a_ quad quad _u_d
+    __a_ __ad __ad ___d
+    */
+    
+    // TODO: Fix thread group boundary issue.
+    // Cannot load anything from gs_cache outside of the range 0..127
+    
+    float i[16];
+    ZERO_INITIALIZE_ARRAY(float, i, 16);
+
+    /*
+    _0,  01, 02, 3,  
+    _4,  05, 06, 7,
+    _8,  09, 10, 11_,
+    _12, 13, 14, 15_
+    */
+    
+    /*
+    // Row 1
+    Load_N0High_N1Low(upLeftIndex, i[0]);
+    Load_N0High_N1Low(upLeftIndex + 1u,  i[1]);
+
+    // Row 2                  
+    Load_N0High_N1Low(upLeftIndex + 8u, i[2]);
+    Load_N0High_N1Low(upLeftIndex + 9u, i[3]);
+
+    // Row 3                  
+    Load_N0High_N1Low(upLeftIndex + 16u, i[4]);
+    Load_N0High_N1Low(upLeftIndex + 17u, i[5]);
+
+    // Row 4                  
+    Load_N0High_N1Low(upLeftIndex + 24u, i[6]);
+    Load_N0High_N1Low(upLeftIndex + 25u, i[7]);
+    */
+
+    // Row 1
+    LoadHighHalf(upLeftIndex, i[0]);
+    Load2Pixels( upLeftIndex + 1u,  i[1], i[2]);
+    LoadLowHalf( upLeftIndex + 2u, i[3]);
+
+    // Row 2                  
+    LoadHighHalf(upLeftIndex + 8u, i[4]);
+    Load2Pixels( upLeftIndex + 9u, i[5], i[6]);
+    LoadLowHalf( upLeftIndex + 10u, i[7]);
+
+    // Row 3                  
+    LoadHighHalf(upLeftIndex + 16u, i[8]);
+    Load2Pixels( upLeftIndex + 17u,i[9], i[10]);
+    LoadLowHalf( upLeftIndex + 18u, i[11]);
+
+    // Row 4                  
+    LoadHighHalf(upLeftIndex + 24u, i[12]);
+    Load2Pixels( upLeftIndex + 25u, i[13], i[14]);
+    LoadLowHalf( upLeftIndex + 26u, i[15]);
+    
+    /*
+    // Row 1
+    Load2Pixels(upLeftIndex, i[0], i[1]);
+    Load2Pixels(upLeftIndex + 1u, i[2], i[3]);
+    // Row 2
+    Load2Pixels(upLeftIndex + 8u, i[4], i[5]);
+    Load2Pixels(upLeftIndex + 9u, i[6], i[7]);
+    // Row 3
+    Load2Pixels(upLeftIndex + 16u, i[8], i[9]);
+    Load2Pixels(upLeftIndex + 17u,i[10], i[11]);
+    // Row 4
+    Load2Pixels(upLeftIndex + 24u, i[12], i[13]);
+    Load2Pixels(upLeftIndex + 25u,i[14], i[15]);
+    */
+    
+    const float3x3 pm00 =
+    {
+        i[0],  i[1],  i[2],
+        i[4],  i[5],  i[6],
+        i[8],  i[9],  i[10]
+    };    
+    const float3x3 pm10 =
+    {
+        i[1],  i[2],  i[3], 
+        i[5],  i[6],  i[7], 
+        i[9], i[10], i[11]
+    };
+    const float3x3 pm01 =
+    {
+        i[4],  i[5],  i[6],
+        i[8],  i[9], i[10],
+        i[12], i[13], i[14]
+    };
+    const float3x3 pm11 =
+    {
+        i[5],  i[6],  i[7],
+        i[9], i[10], i[11],
+        i[13], i[14], i[15]
+    };
+        
+    std = std_dev_3x3_f4(pm00, pm10, pm01, pm11);
+    
+    Store2Pixels(cacheIndex, std.x, std.y);
+    Store2Pixels(cacheIndex + 8u, std.z, std.w);
+}
+
+// https://stackoverflow.com/questions/14415753/wrap-value-into-range-min-max-without-division
+uint wrap_range(const in uint value, const in uint max)
+{
+    return (value + max) % (max * 2 + 1) - max;
+}
+
+/*
+SV_GroupThreadID = ID of thread in a thread group; range depends on numthreads.
+SV_GroupID = ID of thread group; range depends on Dispatch call.
+SV_DispatchThreadID = SV_GroupID * numthreads + SV_GroupThreadID.              
+SV_GroupIndex = The "flattened" index of a compute shader thread within a thread group, which turns the
+                multi-dimensional SV_GroupThreadID into a 1D value. SV_GroupIndex varies
+                from 0 to (numthreadsX * numthreadsY * numThreadsZ) – 1.
+*/
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void STD_DEV(uint2 groupThreadId : SV_GroupThreadID,
+             uint2 groupId : SV_GroupID,
+             uint3 dispatchThreadId : SV_DispatchThreadID,
+             uint groupIndex : SV_GroupIndex)
+{
+    // const uint2 px_id = dispatchThreadId.xy - (groupIndex+1);
+    // const float2 uv = (px_id) * _Size.zw;
+    
+    const uint2 size = (uint2(_Size.xy)) - 1u;
+    const uint2 id = dispatchThreadId.xy;
+    // float2 gatherUV = (floor(uv * _Size.xy - 0.5) + 1.0) / _Size.xy;
+    
+    /*                                     numthreads(8,8,1)
+     *  Resolution    groupId[0 - __]  groupThreadId[0 - __]  dispatchThreadId[0 - __]   groupIndex[0 - __]          
+     *  1920x1080  :  uint2(239, 134)              (7, 7, 0)      uint3(1919, 1079, 1)             uint[63]  
+     *  2560x1440  :  uint2(319, 179)              (7, 7, 0)      uint3(2559, 1439, 1)             uint[63]  
+     *  3840x2160  :  uint2(479, 269)              (7, 7, 0)      uint3(3839, 2159, 1)             uint[63]  
+    */
+    
+    // Upper-left pixel coordinate of the quad that this thread will read.
+    const int2 threadUL = (groupId << 3u) + (groupThreadId << 1u) - 8;
+    //                      (groupId * 8) +   (groupThreadId * 2) -   (groupId * 4)
+    const uint2 uthreadUL = uint2(max(0, threadUL));
+    // groupThreadId << 1 = each thread reads its own 2x2 quad
+    // groupId << 3 = offset the group's UL position by 8 (the width of the area we are writing)
+    
+    const uint2 c00 = min(uthreadUL + uint2(0u, 0u), size);
+    const uint2 c10 = min(uthreadUL + uint2(1u, 0u), size);
+    const uint2 c01 = min(uthreadUL + uint2(0u, 1u), size);
+    const uint2 c11 = min(uthreadUL + uint2(1u, 1u), size);
+    
+    const float p00 = Length2(Source[c00].rgb);
+    const float p10 = Length2(Source[c10].rgb);
+    const float p01 = Length2(Source[c01].rgb);
+    const float p11 = Length2(Source[c11].rgb);
+    
+    // Store the 4 pixels in LDS.
+    const uint row = (groupThreadId.y << 4u); // Left shift 4 to get the fullscreen coord
+    const uint destIdx = row + groupThreadId.x;
+    
+    Store2Pixels(destIdx, p00, p10);
+    Store2Pixels(destIdx + 8u, p01, p11);
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    const uint2 id00 = (id << 1u) + uint2(0, 0);
+    const uint2 id10 = (id << 1u) + uint2(1, 0);
+    const uint2 id01 = (id << 1u) + uint2(0, 1);             
+    const uint2 id11 = (id << 1u) + uint2(1, 1); 
+    
+    // const uint2 id00 = min((uthreadUL << 1u) + uint2(0u, 0u), size); 
+    // const uint2 id10 = min((uthreadUL << 1u) + uint2(1u, 0u), size); 
+    // const uint2 id01 = min((uthreadUL << 1u) + uint2(0u, 1u), size); 
+    // const uint2 id11 = min((uthreadUL << 1u) + uint2(1u, 1u), size); 
+    
+    // outIndex : 0 to 127
+    const uint outIndex = row + (groupThreadId.x << 1u);
+    const uint leftMostIndex = destIdx + (groupThreadId.x & 4u); // index for the pixel 4 to the left of outIndex
+    const uint topMostIndex = (groupThreadId.y << 3u) + groupThreadId.x;
+    
+    // const uint rowAbove = (groupThreadId.y << 3u);
+    // const uint topLeftMostIndex = (groupThreadId.y << 3u) + groupThreadId.x - 2;
+    // const uint2 check = uint2(8u + (groupThreadId.y & 1u), (groupThreadId.x & 1u));
+    
+    const uint upLeftMostIndex = destIdx + (groupThreadId.x & 1u) - 9u;
+    const uint ulMostIndex = destIdx - ((groupThreadId.x << 1u & 8u) + (groupThreadId.y & 1u));
+    // const uint topLeftMostIndex = destIdx - (groupThreadId.x & 2u * groupThreadId.x & 4u + 1);
+    
+    // Store standard deviation for the 4 pixels.
+    float4 std = 0;
+    /*
+    const bool up = outIndex < 8u;
+    const bool left = outIndex % 8u == 0;
+    const bool right = (outIndex + 1u) % 8u == 0;
+    const bool down = outIndex > 119;
+    */
+    const bool up = (groupThreadId.y == 7);
+    const bool left = (groupThreadId.x == 7);
+    const bool right = (groupThreadId.x == 0);
+    const bool down = (groupThreadId.y == 0);
+    
+    /*
+    uint thread_region = 0;
+
+    if (up)    { thread_region |= TG_Row0; }
+    if (left)  { thread_region |= TG_Col0; }
+    if (right) { thread_region |= TG_Col7; }
+    if (down)  { thread_region |= TG_Row7; }
+    */
+    /*
+    if (up)    { SetBit(thread_region, 1); }
+    if (left)  { SetBit(thread_region, 2); }
+    if (right) { SetBit(thread_region, 3); }
+    if (down)  { SetBit(thread_region, 4); }
+    */
+    
+    /*
+    if (thread_region == TG_Row0)
+    {
+        StdDevTop(outIndex, destIdx, std);
+    }
+    if (thread_region == TG_Row7)
+    {
+        StdDevBottom(outIndex, destIdx, std);
+    }
+    if (thread_region == TG_Col0)
+    {
+        StdDevLeft(outIndex, destIdx, std);
+    }
+    if(thread_region == TG_Col7)
+    {
+        StdDevRight(outIndex, destIdx, std);
+    }
+    */
+    
+    /*
+    if (all(id00 == uint2(0, size.y)))
+    {
+        StdDevUL(outIndex, destIdx, std);
+    }
+    if (all(id10 == size))
+    {
+        StdDevUR(outIndex, destIdx, std);
+    }
+    if (all(id01 == 0u))
+    {
+        StdDevBL(outIndex, destIdx, std);
+    }
+    if (all(id11 == uint2(size.x, 0)))
+    {
+        StdDevBR(outIndex, destIdx, std);
+    }
+    */
+    
+    // if (thread_region == 0u)
+    {
+        StdDevQuad(outIndex, upLeftMostIndex, std);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    /*
+    // TODO: MJP implementation stores p00, p10, p01, p11 as four consecutive array entries. Investigate.
+    // Parallel reduction
+    UNITY_UNROLLX(128);
+    for(uint s = 128 / 2; s > 0; s >>= 1)
+    {
+    if(outIndex < s)
+        AddToOffsetStoredPixel(outIndex, s);
+    GroupMemoryBarrierWithGroupSync();
+    }
+    // Add all stored values.
+
+    // The first thread in each threadGroup calculates the group's mean value.
+    if(all(groupThreadId == 0)) // if groupThreadId 0,0
+    {
+    uint gs_cache0 = 0;
+    Load1Uint(0, gs_cache0); // Uint sum of 128 gs entries.
+    float gs_cache_sum = AddFirst16AndLast16Bits_uint(gs_cache0); // Float sum of 256 pixels.
+    gs_cache_sum /= (256);
+    StoreLowHalf(0, gs_cache_sum);
+    MeanStd += gs_cache_sum;
+    // 256 = 4 texels per thread * 64 threads
+    // Sum of 256 pixels / 256
+    // Add group's mean to _MeanStd
+    GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Have one thread get the mean of the sum of groups' mean deviation.
+    if (all(id == 0)) // if dispatchThreadId 0,0
+    {
+    // Sum of groups' means / total number of groups
+    MeanStd /= (TotalNumGroups);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    */
+    
+    // Write whether current pixel's std-dev is less than mean std-dev.
+    // If pixel mean std-dev > texture mean std-dev, pixel should be projected to edge or line subspace.
+    // If pixel mean std-dev !> texture mean std-dev, pixel is part of a uniform-luminance region.
+    
+    // float4 deviation = 0;
+    // Load2Pixels(destIndex, deviation.x, deviation.y );
+    // Load2Pixels(destIndex + 8, deviation.z, deviation.w );
+    
+    Result[id00] = std.x;
+    Result[id10] = std.y;
+    Result[id01] = std.z;
+    Result[id11] = std.w;
+    // GroupMemoryBarrierWithGroupSync();
+    
+    // DrawThreadGroupBorders(false, 8, groupId, groupThreadId, Result, id00);
+}

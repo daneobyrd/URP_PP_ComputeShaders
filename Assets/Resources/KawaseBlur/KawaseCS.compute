@@ -1,0 +1,71 @@
+﻿/*
+Inspired by: https://github.com/Daniel-A-Gutierrez/URP-Tech-Art-Showcase/tree/master/Assets/wk1_kawase
+Kawase Bloom Blur compute shader implementation created in the video "Writing Render Passes Using the scriptable Render Pipeline in Unity"
+Here: https://youtu.be/rimx8nnsbRs
+
+His implementation is based on this fantastic Intel article about real-time gpu-based blurring
+Here: https://www.intel.com/content/www/us/en/developer/articles/technical/an-investigation-of-fast-real-time-gpu-based-image-blur-algorithms.html
+*/
+
+#pragma kernel KBlur
+#pragma kernel KBlurUpsample
+
+// only imported to avoid re-declaring samplers
+#include "Packages/com.unity.render-pipelines.universal/Shaders/PostProcessing/Common.hlsl"
+
+TEXTURE2D(_Source);
+RW_TEXTURE2D(half4, _Result);
+
+CBUFFER_START(cb)
+float offset;
+float4 size; // xy: frame dimensions, zw: unused
+CBUFFER_END
+
+[numthreads(8, 8, 1)]
+void KBlur(uint2 groupId : SV_GroupID,
+           uint2 groupThreadId : SV_GroupThreadID,
+           uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    // Type-cast to float2 to prevent the compiler from making possible type-cast mistakes.
+    const float2 size_f = asfloat(uint2(size.xy) - 1u);
+    const float2 texel_size = rcp(size_f);
+    const float2 id = dispatchThreadId.xy;
+
+    // ┌──┬──┬──┬──┐
+    // ├─c00─┼─c01─┤
+    // ├──┼ ═╬═ ┼──┤
+    // ├─c10─┼─c11─┤
+    // └──┴──┴──┴──┘
+    static float2 skip[4] =
+    {
+        float2(-offset, offset), float2(offset, offset),
+        float2(-offset, -offset), float2(offset, -offset)
+    };
+
+    // Offset sample coords
+    const float2 cx = float2(clamp(id, 0, size_f) * texel_size);
+    const float2 c00 = float2(clamp(id + skip[0], 0, size_f) * texel_size);
+    const float2 c01 = float2(clamp(id + skip[1], 0, size_f) * texel_size);
+    const float2 c10 = float2(clamp(id + skip[2], 0, size_f) * texel_size);
+    const float2 c11 = float2(clamp(id + skip[3], 0, size_f) * texel_size);
+    // Linear sampling at offset coords
+    const real4 px = SAMPLE_TEXTURE2D_LOD(_Source, sampler_LinearClamp, cx, 0);
+    const real4 p00 = SAMPLE_TEXTURE2D_LOD(_Source, sampler_LinearClamp, c00, 0);
+    const real4 p01 = SAMPLE_TEXTURE2D_LOD(_Source, sampler_LinearClamp, c01, 0);
+    const real4 p10 = SAMPLE_TEXTURE2D_LOD(_Source, sampler_LinearClamp, c10, 0);
+    const real4 p11 = SAMPLE_TEXTURE2D_LOD(_Source, sampler_LinearClamp, c11, 0);
+    
+    _Result[id] = real4((px + p00 + p10 + p11 + p01) / 5.0f);
+}
+
+[numthreads(8,8,1)]
+void KBlurUpsample(uint2 groupId : SV_GroupID,
+                   uint2 groupThreadId : SV_GroupThreadID,
+                   uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const float2 size_f = uint2(size.xy) - 1u;
+    const float2 texel_size = rcp(size_f);
+    const float2 id = dispatchThreadId.xy;
+    
+    _Result[id] = SAMPLE_TEXTURE2D_LOD(_Source, sampler_LinearClamp, float2(clamp(id, 0, size_f) * texel_size), 0);
+}

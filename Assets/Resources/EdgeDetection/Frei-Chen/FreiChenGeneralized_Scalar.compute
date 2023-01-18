@@ -1,0 +1,515 @@
+﻿#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+#pragma kernel KFreiChenGeneralizedScalar         KERNEL_SIZE=8  FREI_CHEN_GENERALIZED_SCALAR=KFreiChenGeneralizedScalar
+
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Common.hlsl"
+
+// #include "Assets/Resources/Utilities/ThreadGroupTiling.hlsl"
+// #include "Assets/Resources/Utilities/Compute/ViewThreadGroupDebug.hlsl"
+#include "Assets/Resources/Utilities/MathUtils/float_bit_math.hlsl"
+
+// #include "Helpers/FreiChen_Common.hlsl"
+#include "Helpers/FreiChen_General.hlsl"
+
+TEXTURE2D(Source);
+TEXTURE2D(stdDevTexCS);
+RW_TEXTURE2D(float4, Result);
+SAMPLER(sampler_LinearClamp);
+
+CBUFFER_START(cbuff)
+float4 _Size; // x: src width, y: src height, z: 1/width, w: 1/height
+CBUFFER_END
+
+// Constants
+static const float TotalNumThreads = 64; // numthreads.x * numthreads.y
+static const float TotalNumGroups = ceil(_Size.x / 8) * ceil(_Size.y / 8);
+
+// 16x16 pixel grid will be read by an 8x8 thread group.
+// 8x8 center with four pixel padding on each side.
+
+// Each thread reads four pixels and stores them in groupShard memory.
+
+groupshared uint gs_cacheR[128];
+
+// Pack two float16 in a 32-bit uint and store in gs_cache.
+void Store2Pixels(uint index, float pixel1, float pixel2)
+{
+    gs_cacheR[index] = f32tof16(pixel1.r) | f32tof16(pixel2.r) << 16;
+}
+
+// Load two float16 from gs_cache.
+void Load2Pixels(uint index, out float pixel1, out float pixel2)
+{
+    const uint rr = gs_cacheR[index];
+    pixel1 = float(f16tof32(rr));
+    pixel2 = float(f16tof32(rr >> 16));
+}
+
+void Store1Pixel(uint index, float pixel)
+{
+    gs_cacheR[index] = asuint(pixel);
+}
+void Load1Pixel(uint index, out float pixel)
+{
+    pixel = asfloat(gs_cacheR[index]);
+}
+
+void Load1Uint(uint index, out uint pixel)
+{
+    pixel = uint(gs_cacheR[index]);
+}
+uint Load1Uint(uint index)
+{
+    return uint(gs_cacheR[index]);
+}
+
+void StoreLowHalf(uint index, const in float pixel)
+{
+    gs_cacheR[index] |= f32tof16(pixel);
+}
+void LoadLowHalf(uint index, out float pixel)
+{
+    const uint rr = gs_cacheR[index];
+    pixel = float(f16tof32(rr));
+}
+
+void StoreHighHalf(uint index, const in float pixel)
+{
+    gs_cacheR[index] = uint(f32tof16(pixel) << 16);
+}
+void LoadHighHalf(uint index, out float pixel)
+{
+    const uint rr = gs_cacheR[index];
+    pixel = float(f16tof32(rr >> 16));
+}
+
+void AddtoStoredPixelLowHalf(uint index, inout float pixel)
+{
+    gs_cacheR[index] += f32tof16(pixel);
+}
+void AddtoStoredPixel(uint index, const in uint pixel)
+{
+    gs_cacheR[index] += asuint(pixel);
+}
+
+void Add2Pixels(uint index, inout float sum)
+{
+    float2 pixel;
+    Load2Pixels(index, pixel.x, pixel.y);
+
+    // dot(v, 1): multiplication by 1 is ignored = (v.x + v.y + v.z + v.w)
+    sum += dot(pixel, 1);
+}
+void AddCachedToFloat32(uint index, inout float pixel)
+{
+    pixel += asfloat(gs_cacheR[index]);
+}
+void AddCachedTo2Pixels(uint index, inout float pixel1, inout float pixel2)
+{
+    pixel1 += f16tof32(gs_cacheR[index]);
+    pixel2 += f16tof32(gs_cacheR[index] >> 16);
+}
+void AddLowHalfToFloat(uint index, inout float pixel)
+{
+    pixel += f16tof32(gs_cacheR[index]);
+}
+void AddHighHalfToFloat(uint index, inout float pixel)
+{
+    pixel += f16tof32(gs_cacheR[index] >> 16);
+}
+
+
+/*
+Top-left to bottom-right
+┌──── ┌─────┐-----------------------------------------┐------
+│ s00 │ s10 │     -     -     -     -     -     -     │     -
+├──── ├─────┼─────┐-----------------------------------│------ 
+│ s01 │ s11 │ s21 │ s31 -     -     -     -     -     │     - 
+└──── ├─────┼─────┼─────┐-----------------------------│------ 
+-     │     │ s22 │ s32 │     -     -     -     -     │     - 
+------│-----└─────┼─────┤-----------------------------│------ 
+-     │     - s23 │ s33 │ s43 - s53 -     -     -     │     - 
+------│-----------└─────┘-----------------------------│------ 
+-     │     -     -     - s44 - s54 -     -     -     │     - 
+------│-----------------------------┌─────┐-----------│------ 
+-     │     -     -     - s46 - s55 │ s65 │ s75 -     │     - 
+------│-----------------------------├─────┼─────┐-----│------ 
+-     │     -     -     -     -     │ s66 │ s76 │     │     - 
+------│-----------------------------└─────┼─────┼─────┤ ────┐ 
+-     │     -     -     -     -     - s67 │ s77 │ s87 │ s97 │
+------│-----------------------------------└─────┼─────┤ ────┤
+-     │     -     -     -     -     -     -     │ s88 │ s98 │
+------└-----------------------------------------└─────┘ ────┘
+*/
+void load_diagonal(uint upLeftMostIndex, uint2 groupThreadId, out float diag)
+{
+    float
+    s00, s10,
+    s01, s11, s21, s31,
+              s22, s32,
+              s23, s33, s43, s53,
+    
+                        s45, s55, s65, s75,
+                                  s66, s76,
+                                  s67, s77, s87, s97,
+                                            s88, s98;
+
+    Load2Pixels(upLeftMostIndex, s00, s10);
+    Load2Pixels(upLeftMostIndex + 8u, s01, s11);
+
+    Load2Pixels(upLeftMostIndex + 9u, s21, s31);
+    Load2Pixels(upLeftMostIndex + 17u, s22, s32);
+    Load2Pixels(upLeftMostIndex + 25u, s23, s33);
+    
+    Load2Pixels(upLeftMostIndex + 26u, s43, s53);
+    Load2Pixels(upLeftMostIndex + 42u, s45, s55);
+
+    Load2Pixels(upLeftMostIndex + 43u, s65, s75);
+    Load2Pixels(upLeftMostIndex + 51u, s66, s76);
+    Load2Pixels(upLeftMostIndex + 59u, s67, s77);
+
+    Load2Pixels(upLeftMostIndex + 60u, s87, s97);
+    Load2Pixels(upLeftMostIndex + 68u, s88, s98);
+    
+    // The overlap is the 8x9 region that both 9x9 samples need.
+    const float diag1_shared = s11 + s22 + s33 + s66 + s77 + s88; // Needs 43
+    const float diag2_shared = s10 + s21 + s32 + s65 + s76 + s87; // Needs 55
+    
+    // const float sharedExtraSum = s31 + s23 + s75 + s67;
+
+    // Odd thread
+    if (groupThreadId.x & 1)
+    {
+        diag = diag2_shared + s43 + s98;
+        // diag_extra = diag1_shared + s97 + sharedExtraSum;
+        return;
+    }
+    
+    diag = s00 + diag1_shared + s55;
+    // diag_extra = s01 + diag2_shared + sharedExtraSum;
+}
+
+/*
+Top-right to bottom-left
+------┌-----------------------------------------┌─────┐ ────┐
+-     │     -     -     -     -     -     -     │ s80 │ s90 │
+------│-----------------------------------┌─────┼─────┤ ────┘ 
+-     │     -     -     -     -     - s61 │ s71 │ s81 │ s92 - 
+------│-----------------------------┌─────┼─────┼─────┤------ 
+-     │     -     -     -     -     │ s62 │ s72 │     │     - 
+------│-----------------------------├─────┼─────┘-----│------ 
+-     │     -     -     -     -     │ s63 │ s73 -     │     - 
+------│-----------------------------└─────┘-----------│------ 
+-     │     -     -     -     -     -     -     -     │     - 
+------│-----------┌─────┐-----------------------------│------ 
+-     │     - s25 │ s35 │     -     -     -     -     │     - 
+------│-----┌─────┼─────┤-----------------------------│------ 
+-     │     │ s26 │ s36 │     -     -     -     -     │     - 
+------├─────┼─────┼─────┘-----------------------------│------ 
+- s07 │ s17 │ s27 │ s37 -     -     -     -     -     │     -
+┌──── ├─────┼─────┘-----------------------------------│------
+│ s08 │ s18 │     -     -     -     -     -     -     │     -
+└──── └─────┘-----------------------------------------┘------
+*/
+void load_anti_diagonal(uint upLeftMostIndex, uint groupThreadId, out float anti_diag)
+{
+    float
+                                                s80, s90,
+                                      s61, s71, s81, s91,
+                                      s62, s72,
+                            s43, s53, s63, s73,
+
+                            s45, s55,
+                  s25, s35,
+                  s26, s36,
+        s07, s17, s27, s37,
+        s08, s18;
+
+    Load2Pixels(upLeftMostIndex + 4u, s80, s90);
+    Load2Pixels(upLeftMostIndex + 12u, s81, s91);
+
+    Load2Pixels(upLeftMostIndex + 11u, s61, s71);
+    Load2Pixels(upLeftMostIndex + 19u, s62, s72);
+    Load2Pixels(upLeftMostIndex + 27u, s63, s73);
+    
+    Load2Pixels(upLeftMostIndex + 26u, s43, s53);
+    Load2Pixels(upLeftMostIndex + 42u, s45, s55);
+
+    Load2Pixels(upLeftMostIndex + 41u, s25, s35);
+    Load2Pixels(upLeftMostIndex + 49u, s26, s36);
+    Load2Pixels(upLeftMostIndex + 57u, s27, s37);
+
+    Load2Pixels(upLeftMostIndex + 56u, s07, s17);
+    Load2Pixels(upLeftMostIndex + 64u, s08, s18);
+
+    // The overlap is the 8x9 region that both 9x9 samples need.
+
+    const float anti_diag00_shared = s80 + s71 + s62 + s35 + s26 + s17;
+    const float anti_diag10_shared = s81 + s72 + s63 + s36 + s27 + s18;
+    
+    // const float sharedExtraSum = s61 + s73 + s25 + s37;
+
+    // Odd thread
+    if (groupThreadId.x & 1)
+    {
+        anti_diag = anti_diag00_shared + s53 + s08;
+        // anti_extra = anti_diag10_shared + s07 + sharedExtraSum;
+        return;
+    }
+    
+    anti_diag = anti_diag10_shared + s45 + s90;
+    // anti_extra = anti_diag00_shared + s91 + sharedExtraSum;
+}
+
+
+/*
+Envision the uint array gs_cacheR[128] as an 8x16 grid.
+• 2 float16 stored in each 32-bit uint
+Load a 5x5 section from gs_cacheR to get a 9x9 pixel sample.
+• 5x5 section: 10x10 float16 : 100 pixels
+Since the generalized Frei-Chen filter is 9x9, one column of pixels won't be used by adjacent threads.
+100 - 81 = 9 unused pixels
+*/
+
+/*
+2D Representation of the 1D array groupshared uint gs_cacheR[128]
+┌──────┬──────┬──────┬──────┬──────┐  ────┬──────┬──────┐
+│  [0] │  [1] │  [2] │  [3] │  [4] │  [5] │  [6] │  [7] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤ 
+│  [8] │  [9] │ [10] │ [11] │ [12] │ [13] │ [14] │ [15] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤ 
+│ [16] │ [17] │ [18] │ [19] │ [20] │ [21] │ [22] │ [23] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤
+│ [24] │ [25] │ [26] │ [27] │ [28] │ [29] │ [30] │ [31] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤
+│ [32] │ [33] │ [34] │ [35] │ [36] │ [37] │ [38] │ [39] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤
+│ [40] │ [41] │ [42] │ [43] │ [44] │ [45] │ [46] │ [47] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤ 
+│ [48] │ [49] │ [50] │ [51] │ [52] │ [53] │ [54] │ [55] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤ 
+│ [56] │ [57] │ [58] │ [59] │ [60] │ [61] │ [62] │ [63] │
+├──────┼──────┼──────┼──────┼──────┤  ────┼──────┼──────┤ 
+│ [64] │ [65] │ [66] │ [67] │ [68] │ [69] │ [70] │ [71] │
+└──────┴──────┴──────┴──────┴──────┘  ────┼──────┼──────┤ 
+│ [72] │ [73] │ [74] │ [75] │ [76] │ [77] │ [78] │ [79] │
+├──────┼──────┼──────┼──────┼──────┼──────┼──────┼──────┤
+│      │      │      │      │      │      │      │      │
+...
+
+Example:
+Thread(0, 0) and thread(1, 0) load the section with the bounds (0, 4, 64, 68).
+
+gs_cacheR
+┌───────┬───────┬───────┬───────┬───────┐
+│  [0]  │  [1]  │  [2]  │  [3]  │  [4]  │
+
+corresponding pixels unpacked from each float32 entry
+-----------------------------------------
+│ 0 │ 1 │ 2 │ 3 │ 4 │ 5 │ 6 │ 7 │ 8 │ 9 │
+
+Thread(0, 0)'s SAT includes the sum of pixels 0..8 .
+Thread(1, 0)'s SAT includes the sum of pixels 1..9 .
+
+Adjacent threads access the same groupshared cache entries.
+*/
+// SAT: Summed-Area-Table
+void thread_SAT(uint upLeftMostIndex, uint2 groupThreadId, out float thread_sum)
+{
+    
+    // Index for the first entry in each row of the 10x9 section.
+    const uint rowStart_index[9] =
+    {
+        (upLeftMostIndex),
+        (upLeftMostIndex + 8u),
+        (upLeftMostIndex + 16u),
+        (upLeftMostIndex + 24u),
+        (upLeftMostIndex + 32u),
+        (upLeftMostIndex + 40u),
+        (upLeftMostIndex + 48u),
+        (upLeftMostIndex + 56u),
+        (upLeftMostIndex + 64u)
+    };
+
+    thread_sum = 0;
+    float column_0 = 0;
+
+    // 
+    
+    // Even thread will calculate vertical sum for even columns
+    if (groupThreadId.x % 2)
+    {
+        // (groupThreadId.y == row) ensures that storing the 3, 5, 7, 9 sum in groupsharedMemory
+        // does not overwrite the source values which other threads need.
+        for (uint row = 0; (groupThreadId.y == row) && row < 9; row++)
+        {
+            // Sum of column [0]
+            AddLowHalfToFloat(rowStart_index[row], column_0);
+            // Sum of columns [2], [4], [6], [8]
+            AddLowHalfToFloat(rowStart_index[row] + 1, thread_sum); // [2]
+            AddLowHalfToFloat(rowStart_index[row] + 2, thread_sum); // [4]
+            AddLowHalfToFloat(rowStart_index[row] + 3, thread_sum); // [6]
+            AddLowHalfToFloat(rowStart_index[row] + 4, thread_sum); // [8]
+        }
+        
+        // Store thread_sum in low half of upLeftMostIndex as no other thread will access the low-half of that uint.
+        StoreLowHalf(upLeftMostIndex, thread_sum);
+    }
+    // Barrier to ensure even threads execute first.
+    GroupMemoryBarrierWithGroupSync();
+    
+    // Add column_0 to thread_sum AFTER even thread stored thread_sum in groupshared memory.
+    // Ensures that odd threads will not include column_1 in their SAT
+    thread_sum += column_0;
+
+    // Odd threads will calculate sums of shared columns (1-8), and sum of (1-9)
+    if (!(groupThreadId.x % 2))
+    {
+        for (uint row = 0; (groupThreadId.y == row) && row < 9; row++)
+        {
+            // Load sum of columns 2, 4, 6, 8
+            LoadLowHalf(upLeftMostIndex, thread_sum);
+            
+            // Sum of columns 1-8
+            AddHighHalfToFloat(rowStart_index[row], thread_sum); // thread_sum + column[1]
+            AddHighHalfToFloat(rowStart_index[row] + 1, thread_sum); // + column [3]
+            AddHighHalfToFloat(rowStart_index[row] + 2, thread_sum); // + column [5]
+            AddHighHalfToFloat(rowStart_index[row] + 3, thread_sum); // + column [7]
+
+            // Store in high-half as a precaution to avoid unwanted overwriting of value stored by even thread
+            StoreHighHalf(upLeftMostIndex, thread_sum);
+            
+            // Add column_9 to thread_sum AFTER storing thread_sum in groupshared memory.
+            // Ensures that even threads will not include column_10 in their SAT
+            AddHighHalfToFloat(rowStart_index[row] + 4, thread_sum); // + column 9
+        }
+    }
+    // Barrier to ensure odd threads store sum of 2-9 before any even thread tries to load the sum.
+    GroupMemoryBarrierWithGroupSync();
+
+    // Even thread
+    if (groupThreadId.x % 2)
+    {
+        AddHighHalfToFloat(upLeftMostIndex, thread_sum);
+    }
+}
+
+float4 Gate(uint2 c, float4 compare, float threshold)
+{
+    return abs(Result[c] - compare) < threshold ? Result[c] : compare;
+}
+
+// https://stackoverflow.com/questions/14415753/wrap-value-into-range-min-max-without-division
+uint wrap_range(const in uint value, const in uint max)
+{
+    return (value + max) % (max * 2 + 1) - max;
+}
+
+/*
+SV_GroupID = ID of thread group; range depends on Dispatch call.         
+SV_GroupThreadID = ID of thread in a thread group; range depends on numthreads.
+SV_DispatchThreadID = SV_GroupID * numthreads + SV_GroupThreadID.
+SV_GroupIndex = The "flattened" index of a compute shader thread within a thread group, which turns the
+                multi-dimensional SV_GroupThreadID into a 1D value. SV_GroupIndex varies
+                from 0 to (numthreadsX * numthreadsY * numThreadsZ) – 1.
+
+*/
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void FREI_CHEN_GENERALIZED_SCALAR(uint2 groupId : SV_GroupID,
+                                  uint2 groupThreadId : SV_GroupThreadID,
+                                  uint3 dispatchThreadId : SV_DispatchThreadID,
+                                  uint groupIndex : SV_GroupIndex)
+{
+    const uint2 id = dispatchThreadId.xy;
+    const uint2 size = uint2(_Size.xy) - 1u;
+
+    // Upper-left pixel coordinate of quad that this thread will read
+    const int2 threadUL = (groupId << 3) + (groupThreadId << 1) - 8;
+    // (groupId * 8) + (groupThreadId * 2) - 8
+    const uint2 uthreadUL = uint2(max(0, threadUL));
+
+    const uint2 c00 = min(uthreadUL + uint2(0u, 0u), size);
+    const uint2 c10 = min(uthreadUL + uint2(1u, 0u), size);
+    const uint2 c01 = min(uthreadUL + uint2(0u, 1u), size);
+    const uint2 c11 = min(uthreadUL + uint2(1u, 1u), size);
+
+    // Get pixel intensity.
+    const float p00 = Length2(Source[c00].rgb);
+    const float p10 = Length2(Source[c10].rgb);
+    const float p01 = Length2(Source[c01].rgb);
+    const float p11 = Length2(Source[c11].rgb);
+
+    // Store the 4 pixels in LDS
+    const uint row = groupThreadId.y << 4u;
+    const uint destIdx = row + groupThreadId.x;
+    // destIdx has a range of 0..119
+    // 119 + 8 = 127
+
+    // groupIndex = groupThreadId.y * 8 + groupThreadId.x
+    // destIndex = groupThreadId.y * 16 + groupThreadId.x
+    
+    Store2Pixels(destIdx, p00, p10);
+    Store2Pixels(destIdx + 8u, p01, p11);
+    GroupMemoryBarrierWithGroupSync();
+    
+    // const uint outIndex = row + (groupThreadId.x << 1);
+    // const uint leftMostIndex = destIdx + (groupThreadId.x & 4u);
+    // const uint topMostIndex = (groupThreadId.y << 3) + groupThreadId.x; // 4 above dispatchId pixel
+    
+    // const uint upLeftIndex = ((groupThreadId.y << 3) + ( (groupThreadId.x & 6u) >> 1)) * (1+(groupThreadId.y != 0u) );
+    // const uint upLeftIndex = groupIndex - (groupIndex & 1u);
+    const uint upLeftIndex = destIdx >> 1;
+    
+    // * * * * * * * * * * * * * * * * * * * * * * * * * //
+    //   Fetch sum of texels' per thread from gs_cache   //
+    // * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+    float diag = 0;
+    float anti_diag = 0;
+    float diag_extra = 0, anti_extra = 0;
+    float thread_sum = 0;
+
+    // diag sample: (groupThreadId.y << 4) + groupThreadId.y
+    load_diagonal(upLeftIndex, groupThreadId.x, diag);
+    load_anti_diagonal(upLeftIndex, groupThreadId.x, anti_diag);
+
+    // MemoryBarrier to ensure above functions do not load thread_SAT values from groupshared memory.
+    GroupMemoryBarrierWithGroupSync();
+
+    // Summed Area Table
+    thread_SAT(upLeftIndex, groupThreadId, thread_sum);
+    
+    // Measurement subspace
+    const float uniform_projection = thread_sum * measurement_coeff;
+
+    // Subtract diag and anti-diag to ensure correct sample pattern for edge and line filters.
+    thread_sum -= (diag + anti_diag);
+    
+    // Edge subspace: no thread_sum used because edge_coeff is 0
+    const float edge_projection = edge_diag_coeff * (diag - anti_diag); // same as 0.5 * diag + (-0.5 * anti_diag)
+    // Line subspace
+    const float line_projection = line_x_coeff * (diag + anti_diag) + line_inv_coeff * thread_sum;
+
+    // Whether pixel belongs to uniform-luminance region or is an edge/line.
+    const float2 uv = float2(id) * (_Size.zw / 2);
+    const float2 co8 = float2((uint2(floor(_Size.xy)) >> 9) - 1) * (_Size.zw / 2); // pseudo center coord of mipLevel 8
+
+    const float4 mean_deviation = SAMPLE_TEXTURE2D_LOD(stdDevTexCS, sampler_LinearClamp, co8, 8);
+
+    // if pixel's standard deviation is greater than the texture's mean standard deviation, the pixel is an edge or line.
+    const float4 pixel_is_edgeOrLine = stdDevTexCS[id] > mean_deviation;
+
+    // if none of the components are greater than the mean standard deviation...
+    if (any(pixel_is_edgeOrLine) == false)
+    {
+        // ...pixel belongs to a uniform luminance region
+        Result[id] = uniform_projection;
+        return;
+    }
+
+    const float edge_sq_norm = Sq(edge_projection);
+    const float line_sq_norm = Sq(line_projection);
+    const bool pixel_is_edge = edge_sq_norm > line_sq_norm;
+    Result[id] = pixel_is_edge ? edge_projection : line_projection;
+}
