@@ -1,0 +1,160 @@
+﻿#pragma only_renderers d3d11 playstation xboxone xboxseries vulkan metal switch
+
+#pragma kernel KStdDev                      KERNEL_SIZE=8  STD_DEV=KStdDev
+
+// #include "Packages/com.unity.render-pipelines.universal/Shaders/PostProcessing/Common.hlsl"
+// #include "Assets/Resources/Utilities/Compute/ThreadGroupTiling.hlsl"
+#include "Assets/Resources/Utilities/MathUtils/std_deviation.hlsl"
+#include "Helpers/FreiChen_Common.hlsl"
+
+TEXTURE2D(Source);
+// Texture2D<float> Subspace;
+RW_TEXTURE2D(float4, Result);
+
+CBUFFER_START(cbuff)
+float4 _Size; // x: src width, y: src height, z: 1/width, w: 1/height
+// float MeanStd;
+CBUFFER_END
+
+// Constants
+static const float TotalNumThreads = 81; // numthreads.x * numthreads.y
+static const float TotalNumGroups = ceil(_Size.x /8) * ceil(_Size.y /8);
+
+// 16x16 pixel grid will be read by an 8x8 thread group.
+// 8x8 center with four pixel padding on each side.
+
+groupshared uint gs_cacheR[81];
+
+// https://stackoverflow.com/questions/14415753/wrap-value-into-range-min-max-without-division
+uint wrap_range(const in uint value, const in uint max)
+{
+    return (value + max) % (max * 2 + 1) - max;
+}
+
+/*
+SV_GroupThreadID = ID of thread in a thread group; range depends on numthreads.
+SV_GroupID = ID of thread group; range depends on Dispatch call.
+SV_DispatchThreadID = SV_GroupID * numthreads + SV_GroupThreadID.              
+SV_GroupIndex = The "flattened" index of a compute shader thread within a thread group, which turns the
+                multi-dimensional SV_GroupThreadID into a 1D value. SV_GroupIndex varies
+                from 0 to (numthreadsX * numthreadsY * numThreadsZ) – 1.
+*/
+
+[numthreads(KERNEL_SIZE, KERNEL_SIZE, 1)]
+void STD_DEV(uint2 groupThreadId : SV_GroupThreadID,
+             uint2 groupId : SV_GroupID,
+             uint3 dispatchThreadId : SV_DispatchThreadID,
+             uint groupIndex : SV_GroupIndex)
+{
+    // const uint2 px_id = dispatchThreadId.xy - (groupIndex+1);
+    // const float2 uv = (px_id) * _Size.zw;
+    
+    const uint2 size = (uint2(_Size.xy)) - 1u;
+    const uint2 id = dispatchThreadId.xy;
+    // float2 gatherUV = (floor(uv * _Size.xy - 0.5) + 1.0) / _Size.xy;
+    
+    /*                                     numthreads(8,8,1)
+     *  Resolution    groupId[0 - __]  groupThreadId[0 - __]  dispatchThreadId[0 - __]   groupIndex[0 - __]          
+     *  1920x1080  :  uint2(239, 134)              (7, 7, 0)      uint3(1919, 1079, 1)             uint[63]  
+     *  2560x1440  :  uint2(319, 179)              (7, 7, 0)      uint3(2559, 1439, 1)             uint[63]  
+     *  3840x2160  :  uint2(479, 269)              (7, 7, 0)      uint3(3839, 2159, 1)             uint[63]  
+    */
+
+    const int2 sampleCo = max(dispatchThreadId - 1, 0);
+    
+    // Upper-left pixel coordinate of the quad that this thread will read.
+    const int2 threadUL = (groupId << 3u) + (groupThreadId << 1u) - 8;
+    //                     (groupId * 8) +   (groupThreadId * 2) - 8
+    const uint2 uthreadUL = uint2(max(0, threadUL));
+    // groupThreadId << 1 = each thread reads its own 2x2 quad
+    // groupId << 3 = offset the group's UL position by 8 (the width of the area we are writing)
+    
+    const uint2 c00 = min(uthreadUL + uint2(0u, 0u), size);
+    const uint2 c10 = min(uthreadUL + uint2(1u, 0u), size);
+    const uint2 c01 = min(uthreadUL + uint2(0u, 1u), size);
+    const uint2 c11 = min(uthreadUL + uint2(1u, 1u), size);
+    
+    const float p00 = Length2(Source[c00].rgb);
+    const float p10 = Length2(Source[c10].rgb);
+    const float p01 = Length2(Source[c01].rgb);
+    const float p11 = Length2(Source[c11].rgb);
+    
+    // Store the 4 pixels in LDS.
+    // const uint row = (groupThreadId.y << 4u); // Left shift 4 to get the fullscreen coord
+    // const uint destIdx = row + groupThreadId.x;
+    
+    // Store2Pixels(destIdx, p00, p10);
+    // Store2Pixels(destIdx + 8u, p01, p11);
+    
+    GroupMemoryBarrierWithGroupSync();
+    
+    // outIndex : 0 to 127
+    // const uint outIndex = row + (groupThreadId.x << 1u);
+    // const uint leftMostIndex = destIdx + (groupThreadId.x & 4u); // index for the pixel 4 to the left of outIndex
+    // const uint topMostIndex = (groupThreadId.y << 3u) + groupThreadId.x;
+    
+    // const uint rowAbove = (groupThreadId.y << 3u);
+    // const uint topLeftMostIndex = (groupThreadId.y << 3u) + groupThreadId.x - 2;
+    // const uint2 check = uint2(8u + (groupThreadId.y & 1u), (groupThreadId.x & 1u));
+    
+    // const uint upLeftMostIndex = destIdx + (groupThreadId.x & 1u) - 9u;
+    // const uint ulMostIndex = destIdx - ((groupThreadId.x << 1u & 8u) + (groupThreadId.y & 1u));
+    // const uint topLeftMostIndex = destIdx - (groupThreadId.x & 2u * groupThreadId.x & 4u + 1);
+    
+    // Store standard deviation for the 4 pixels.
+    float4 std = 0;
+    
+    /*
+    // TODO: MJP implementation stores p00, p10, p01, p11 as four consecutive array entries. Investigate.
+    
+    // Parallel reduction
+    UNITY_UNROLLX(128);
+    for(uint s = 128 / 2; s > 0; s >>= 1)
+    {
+    if(outIndex < s)
+        AddToOffsetStoredPixel(outIndex, s);
+    GroupMemoryBarrierWithGroupSync();
+    }
+    // Add all stored values.
+
+    // The first thread in each threadGroup calculates the group's mean value.
+    if(all(groupThreadId == 0)) // if groupThreadId 0,0
+    {
+        uint gs_cache0 = 0;
+        Load1Uint(0, gs_cache0); // Uint sum of 128 gs entries.
+        float gs_cache_sum = AddFirst16AndLast16Bits_uint(gs_cache0); // Float sum of 256 pixels.
+        gs_cache_sum /= (256);
+        StoreLowHalf(0, gs_cache_sum);
+        MeanStd += gs_cache_sum;
+        // 256 = 4 texels per thread * 64 threads
+        // Sum of 256 pixels / 256
+        // Add group's mean to _MeanStd
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Have one thread get the mean of the sum of groups' mean deviation.
+    if (all(id == 0)) // if dispatchThreadId 0,0
+    {
+    // Sum of groups' means / total number of groups
+    MeanStd /= (TotalNumGroups);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+    */
+    
+    // Write whether current pixel's std-dev is less than mean std-dev.
+    // If pixel mean std-dev > texture mean std-dev, pixel should be projected to edge or line subspace.
+    // If pixel mean std-dev !> texture mean std-dev, pixel is part of a uniform-luminance region.
+    
+    // float4 deviation = 0;
+    // Load2Pixels(destIndex, deviation.x, deviation.y );
+    // Load2Pixels(destIndex + 8, deviation.z, deviation.w );
+    
+    Result[id00] = std.x;
+    Result[id10] = std.y;
+    Result[id01] = std.z;
+    Result[id11] = std.w;
+    // GroupMemoryBarrierWithGroupSync();
+    
+    // DrawThreadGroupBorders(false, 8, groupId, groupThreadId, Result, id00);
+}
